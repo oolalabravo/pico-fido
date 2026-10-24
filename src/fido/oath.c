@@ -24,7 +24,10 @@
 #include "asn1.h"
 #include "crypto_utils.h"
 #include "management.h"
+#include "bsp/board.h"
 extern bool is_nk;
+
+static uint32_t oath_user_present_time_limit = 0;
 
 #define MAX_OATH_CRED   255
 #define CHALLENGE_LEN   8
@@ -122,6 +125,8 @@ INITIALIZER ( oath_ctor ) {
 }
 
 int oath_unload() {
+    oath_user_present_time_limit = 0;
+    led_set_mode(MODE_MOUNTED);
     return PICOKEY_OK;
 }
 
@@ -411,10 +416,32 @@ int cmd_calculate() {
         }
     }
 
+    asn1_ctx_t prop;
+    bool need_touch = false;
+#ifdef ENABLE_OATH_TOUCH_ALWAYS
+    need_touch = true;
+#else
+    if (asn1_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && (prop.data[0] & PROP_TOUCH)) {
+        need_touch = true;
+    }
+#endif
+    if (need_touch) {
+        if (oath_user_present_time_limit == 0 || oath_user_present_time_limit < board_millis()) {
+            if (wait_button_pressed() == true) {
+                led_signal_error();
+                return SW_CONDITIONS_NOT_SATISFIED();
+            }
+            oath_user_present_time_limit = board_millis() + 35000;
+        }
+    }
+
+    led_set_mode(MODE_PROCESSING);
+
     res_APDU[res_APDU_size++] = TAG_RESPONSE + P2(apdu);
 
     int ret = calculate_oath(P2(apdu), key.data, key.len, chal.data, chal.len);
     if (ret != PICOKEY_OK) {
+        led_signal_error();
         return SW_EXEC_ERROR();
     }
     if ((key.data[0] & OATH_TYPE_MASK) == OATH_TYPE_HOTP) {
@@ -432,6 +459,13 @@ int cmd_calculate() {
         free(tmp);
     }
     apdu.ne = res_APDU_size;
+    if ((key.data[0] & OATH_TYPE_MASK) == OATH_TYPE_TOTP && chal.len >= 8) {
+        uint64_t step = get_uint64_t_be(chal.data);
+        uint32_t totp_mode = (step % 2 == 0) ? MODE_TOTP_A : MODE_TOTP_B;
+        led_set_mode(totp_mode);
+    } else {
+        led_signal_success();
+    }
     return SW_OK();
 }
 
@@ -466,10 +500,24 @@ int cmd_calculate_all() {
                 res_APDU[res_APDU_size++] = 1;
                 res_APDU[res_APDU_size++] = key.data[1];
             }
+#ifndef ENABLE_OATH_TOUCH_ALWAYS
             else if (asn1_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && (prop.data[0] & PROP_TOUCH)) {
-                res_APDU[res_APDU_size++] = TAG_TOUCH_RESPONSE;
-                res_APDU[res_APDU_size++] = 1;
-                res_APDU[res_APDU_size++] = key.data[1];
+#else
+            else if (true) {
+#endif
+                if (oath_user_present_time_limit > board_millis()) {
+                    oath_user_present_time_limit = board_millis() + 35000;
+                    res_APDU[res_APDU_size++] = TAG_RESPONSE + P2(apdu);
+                    int ret = calculate_oath(P2(apdu), key.data, key.len, chal.data, chal.len);
+                    if (ret != PICOKEY_OK) {
+                        res_APDU[res_APDU_size++] = 1;
+                        res_APDU[res_APDU_size++] = key.data[1];
+                    }
+                } else {
+                    res_APDU[res_APDU_size++] = TAG_TOUCH_RESPONSE;
+                    res_APDU[res_APDU_size++] = 1;
+                    res_APDU[res_APDU_size++] = key.data[1];
+                }
             }
             else {
                 res_APDU[res_APDU_size++] = TAG_RESPONSE + P2(apdu);
@@ -481,7 +529,27 @@ int cmd_calculate_all() {
             }
         }
     }
+    if (chal.len >= 8) {
+        uint64_t step = get_uint64_t_be(chal.data);
+        uint32_t totp_mode = (step % 2 == 0) ? MODE_TOTP_A : MODE_TOTP_B;
+        led_set_mode(totp_mode);
+    }
     apdu.ne = res_APDU_size;
+    return SW_OK();
+}
+
+int cmd_set_led() {
+    uint8_t mode_sel = P1(apdu);
+    if (mode_sel == 0) {
+        oath_user_present_time_limit = 0;
+        led_set_mode(MODE_MOUNTED);
+    } else if (mode_sel == 1) {
+        led_set_mode(MODE_TOTP_A);
+    } else if (mode_sel == 2) {
+        led_set_mode(MODE_TOTP_B);
+    } else {
+        return SW_INCORRECT_P1P2();
+    }
     return SW_OK();
 }
 
@@ -706,6 +774,7 @@ int cmd_get_credential() {
 #define INS_VALIDATE        0xa3
 #define INS_CALC_ALL        0xa4
 #define INS_SEND_REMAINING  0xa5
+#define INS_SET_LED         0xa6
 #define INS_VERIFY_CODE     0xb1
 #define INS_VERIFY_PIN      0xb2
 #define INS_CHANGE_PIN      0xb3
@@ -723,6 +792,7 @@ static const cmd_t cmds[] = {
     { INS_CALCULATE, cmd_calculate },
     { INS_CALC_ALL, cmd_calculate_all },
     { INS_SEND_REMAINING, cmd_send_remaining },
+    { INS_SET_LED, cmd_set_led },
     { INS_SET_PIN, cmd_set_otp_pin },
     { INS_CHANGE_PIN, cmd_change_otp_pin },
     { INS_VERIFY_PIN, cmd_verify_otp_pin },

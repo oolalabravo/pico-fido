@@ -120,9 +120,11 @@ void *cbor_thread(void *arg) {
         if (m == EV_EXIT) {
             break;
         }
+        led_set_mode(MODE_PROCESSING);
         apdu.sw = (uint16_t)cbor_parse(cbor_cmd, cbor_data, cbor_len);
         if (apdu.sw == 0) {
             DEBUG_DATA(res_APDU, res_APDU_size);
+            led_signal_success();
         }
         else {
             if (apdu.sw >= CTAP1_ERR_INVALID_CHANNEL) {
@@ -132,6 +134,7 @@ void *cbor_thread(void *arg) {
             else {
                 res_APDU[0] = (uint8_t)apdu.sw;
             }
+            led_signal_error();
         }
 
         finished_data_size = res_APDU_size + 1;
